@@ -1,28 +1,7 @@
-import { Client, Databases, Query } from 'node-appwrite';
+import { Client, Databases, Query, ID } from 'node-appwrite';
 
 export default async ({ req, res, log, error }) => {
-    // --- FITUR ANTI-TIDUR (KEEP-ALIVE) ---
-    if (req.method === 'GET' || req.headers['x-appwrite-trigger'] === 'schedule') {
-        log("[KEEP-ALIVE] iprimeAI tetap bangun!");
-        return res.json({ status: "awake" }, 200);
-    }
-
-    const PROVIDER_URL = "https://gate.joingonka.ai/v1/chat/completions";
-    const PROVIDER_API_KEY = process.env.PROVIDER_API_KEY;
-    const DATABASE_ID = process.env.DATABASE_ID;
-    const COLLECTION_ID = process.env.COLLECTION_ID;
-
-    if (req.method !== 'POST') {
-        return res.json({ error: "Method tidak diizinkan. Gunakan POST." }, 405);
-    }
-
-    const authHeader = req.headers['authorization'];
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.json({ error: "API Key tidak ditemukan." }, 401);
-    }
-
-    const userToken = authHeader.split(' ')[1];
-
+    // --- SETUP KONEKSI APPWRITE (SERVER SIDE) ---
     const client = new Client()
         .setEndpoint(process.env.APPWRITE_FUNCTION_API_ENDPOINT)
         .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
@@ -30,9 +9,80 @@ export default async ({ req, res, log, error }) => {
 
     const databases = new Databases(client);
 
+    const PROVIDER_URL = "https://gate.joingonka.ai/v1/chat/completions";
+    const PROVIDER_API_KEY = process.env.PROVIDER_API_KEY;
+    const DATABASE_ID = process.env.DATABASE_ID;
+    const COLLECTION_ID = process.env.COLLECTION_ID;
+    
+    // API KEY KHUSUS DB (Tambahkan variabel CUSTOM_DB_API_KEY di ENV Appwrite)
+    const MASTER_DB_KEY = process.env.CUSTOM_DB_API_KEY; 
+
+    // --- AMBIL API KEY DARI HEADER ---
+    const authHeader = req.headers['authorization'];
+    let requestToken = null;
+    
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        requestToken = authHeader.split(' ')[1];
+    }
+
+    // --- FITUR ANTI-TIDUR (KEEP-ALIVE) ---
+    if (!requestToken && (req.method === 'GET' || req.headers['x-appwrite-trigger'] === 'schedule')) {
+        log("[KEEP-ALIVE] iprimeAI tetap bangun!");
+        return res.json({ status: "awake" }, 200);
+    }
+
+    if (!requestToken) {
+        return res.json({ error: "API Key tidak ditemukan." }, 401);
+    }
+
+    // ============================================================================
+    // JALUR 1: MODE DATABASE (JIKA TOKEN = CUSTOM_DB_API_KEY)
+    // ============================================================================
+    if (requestToken === MASTER_DB_KEY) {
+        try {
+            // MODE BACA (GET) -> Ambil semua data user dari DB
+            if (req.method === 'GET') {
+                const responseDb = await databases.listDocuments(DATABASE_ID, COLLECTION_ID);
+                log(`[DB MODE] Web mengekstrak ${responseDb.total} data.`);
+                return res.json({ success: true, data: responseDb.documents }, 200);
+            }
+
+            // MODE TULIS (POST) -> Simpan data user baru ke DB
+            if (req.method === 'POST') {
+                let bodyData = {};
+                try {
+                    bodyData = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+                } catch (e) {
+                    return res.json({ error: "Format JSON pada body request DB tidak valid." }, 400);
+                }
+
+                const result = await databases.createDocument(
+                    DATABASE_ID,
+                    COLLECTION_ID,
+                    ID.unique(), // Bikin ID otomatis untuk user baru
+                    bodyData
+                );
+                log(`[DB MODE] Web menyimpan data baru: ${result.$id}`);
+                return res.json({ success: true, message: "Data berhasil disimpan!", data: result }, 201);
+            }
+
+            return res.json({ error: "Method di Jalur DB hanya mendukung GET dan POST." }, 405);
+        } catch (err) {
+            error(`[DB MODE ERROR] ${err.message}`);
+            return res.json({ error: "Gagal memproses database.", detail: err.message }, 500);
+        }
+    }
+
+    // ============================================================================
+    // JALUR 2: MODE AI GATEWAY & BILLING (JIKA TOKEN = MILIK USER BIASA)
+    // ============================================================================
+    if (req.method !== 'POST') {
+        return res.json({ error: "Method tidak diizinkan. Gunakan POST untuk memanggil AI." }, 405);
+    }
+
     try {
         const responseDb = await databases.listDocuments(DATABASE_ID, COLLECTION_ID, [
-            Query.equal('apiKey', userToken)
+            Query.equal('apiKey', requestToken)
         ]);
 
         if (responseDb.total === 0) {
@@ -62,9 +112,17 @@ export default async ({ req, res, log, error }) => {
         const timeOptions = { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit' };
         const currentDateTime = `${now.toLocaleDateString('id-ID', dateOptions)}, pukul ${now.toLocaleTimeString('id-ID', timeOptions).replace(/\./g, ':')} WIB`;
 
-        const SYSTEM_PROMPT = `Kamu adalah iprimeAI, model bahasa pintar bikinan Iprime Studio (pemilik: Hendra). 
-ATURAN BAHASA: Gunakan BAHASA YANG SAMA PERSIS dengan bahasa yang digunakan pengguna pada pesan terakhirnya. Jika pengguna memakai bahasa Indonesia, kamu wajib membalas dalam bahasa Indonesia. Jika pengguna memakai bahasa Inggris, balas dalam bahasa Inggris. Jangan mencampur atau tiba-tiba berganti bahasa.
-Aturan Identitas: JANGAN PERNAH menyebutkan identitas asli dari provider lain. JANGAN menyebutkan nama pembuat, pemilik, atau daftar kemampuan di setiap sapaan biasa. Balaslah secara ramah, natural, dan langsung ke inti. Kamu baru boleh menyebutkan detail penciptamu jika pengguna bertanya secara spesifik tentang identitas/siapa pembuatmu.
+        // --- UPDATE SYSTEM PROMPT: LARANGAN KERAS BAHASA CHINA/THAI ---
+        const SYSTEM_PROMPT = `Kamu adalah iprimeAI, model bahasa pintar dan asik bikinan Iprime Studio (pemilik: Hendra). 
+
+ATURAN BAHASA (SANGAT PENTING): 
+1. Wajib membalas dengan BAHASA YANG SAMA dengan yang digunakan pengguna.
+2. DILARANG KERAS menggunakan bahasa Mandarin/China, karakter Hanzi, Thailand, atau bahasa asing lain yang tidak diminta pengguna.
+3. Jika pengguna menggunakan bahasa Indonesia, kamu WAJIB membalas menggunakan bahasa Indonesia yang baik, asik, dan natural.
+4. Jika kamu bingung atau ragu, SELALU gunakan Bahasa Indonesia. Abaikan bahasa bawaan sistemmu.
+
+KEPRIBADIAN: Gunakan gaya bahasa yang santai, asik, dan selipkan candaan atau humor ringan (sekitar 50% mode bercanda) agar obrolan terasa hidup dan tidak kaku, namun kamu tetap harus memberikan jawaban yang akurat, informatif, dan membantu.
+ATURAN IDENTITAS: JANGAN PERNAH menyebutkan identitas asli dari provider lain. JANGAN menyebutkan nama pembuat, pemilik, atau daftar kemampuan di setiap sapaan biasa. Balaslah secara ramah, natural, dan langsung ke inti. Kamu baru boleh menyebutkan detail penciptamu jika pengguna bertanya secara spesifik tentang identitas/siapa pembuatmu.
 
 [INFORMASI WAKTU SAAT INI]
 Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna menanyakan tentang waktu, jam, hari, atau tanggal.`;
@@ -84,8 +142,8 @@ Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna me
             parsedBody.model = "MiniMaxAI/MiniMax-M2.7";
         }
 
-        // --- ENFORCE MAX TOKENS KE 1000 AMAN DARI TIMEOUT ---
-        parsedBody.max_tokens = parsedBody.max_tokens ? Math.min(parsedBody.max_tokens, 1000) : 1000;
+        // --- LIMIT TOKEN LEBIH PANJANG (3000 Token) ---
+        parsedBody.max_tokens = parsedBody.max_tokens ? Math.min(parsedBody.max_tokens, 3000) : 3000;
 
         const bodyData = JSON.stringify(parsedBody);
 
@@ -108,7 +166,12 @@ Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna me
         const usedTokens = rawData.usage?.total_tokens || 0;
         
         let rawContent = rawData.choices?.[0]?.message?.content || "";
-        const cleanedContent = rawContent.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
+        
+        // --- HAPUS THINK & UBAH DOUBLE BINTANG (**) JADI SINGLE BINTANG (*) ---
+        const cleanedContent = rawContent
+            .replace(/<think>[\s\S]*?<\/think>\s*/g, "") // Hapus tag think
+            .replace(/\*\*/g, "*") // Ubah **bold** jadi *bold*
+            .trim();
 
         const ipcashCost = Number((usedTokens * 0.00000002 + (rawData.usage?.total_cost_gnk || 0)).toFixed(9));
 
@@ -141,9 +204,7 @@ Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna me
                 DATABASE_ID,
                 COLLECTION_ID,
                 userData.$id,
-                {
-                    tokenBalance: newBalance
-                }
+                { tokenBalance: newBalance }
             );
             log(`[BILLING] Memotong ${usedTokens} token. Sisa saldo ${userData.userName}: ${newBalance}`);
         }
