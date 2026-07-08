@@ -59,7 +59,7 @@ export default async ({ req, res, log, error }) => {
                 const result = await databases.createDocument(
                     DATABASE_ID,
                     COLLECTION_ID,
-                    ID.unique(), // Bikin ID otomatis untuk user baru
+                    ID.unique(), 
                     bodyData
                 );
                 log(`[DB MODE] Web menyimpan data baru: ${result.$id}`);
@@ -119,7 +119,6 @@ export default async ({ req, res, log, error }) => {
         const timeOptions = { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit' };
         const currentDateTime = `${now.toLocaleDateString('id-ID', dateOptions)}, pukul ${now.toLocaleTimeString('id-ID', timeOptions).replace(/\./g, ':')} WIB`;
 
-        // --- UPDATE SYSTEM PROMPT: LARANGAN KERAS & INSTRUKSI MEMORY ---
         const SYSTEM_PROMPT = `Kamu adalah iprimeAI, model bahasa pintar dan asik bikinan Iprime Studio (pemilik: Hendra). 
 
 ATURAN BAHASA (SANGAT PENTING): 
@@ -133,24 +132,19 @@ KEPRIBADIAN: Gunakan gaya bahasa yang santai, asik, dan selipkan candaan atau hu
 [FITUR INGATAN / MEMORY - SANGAT PENTING]
 Kamu MEMILIKI fitur ingatan permanen. JANGAN PERNAH menolak dengan alasan "saya adalah AI dan tidak bisa menyimpan data".
 Jika pengguna menyuruhmu mengingat, mencatat, atau men-save sesuatu (misal: "ingat ya namaku Budi", "save plat nomorku B 1234"), kamu WAJIB mematuhinya dengan merespons menggunakan tag XML <save_memory>.
-Contoh balasanmu jika disuruh mengingat:
-<save_memory>Nama pengguna adalah Budi. Plat nomor B 1234.</save_memory>
-Siap! Udah aku catet dan simpan di otakku ya!
-
 Ingatan permanen tentang pengguna saat ini:
 ${currentMemory}
 
 [INFORMASI WAKTU SAAT INI]
 Saat ini adalah ${currentDateTime}.`;
 
-        // --- GABUNGKAN HISTORY DB DENGAN PESAN BARU ---
         let clientMessages = parsedBody.messages || [];
-        clientMessages = clientMessages.filter(m => m.role !== 'system'); // Hapus system prompt dari client kalau ada
+        clientMessages = clientMessages.filter(m => m.role !== 'system'); 
 
         const finalMessages = [
             { role: "system", content: SYSTEM_PROMPT },
-            ...dbHistory,      // Masukkan riwayat obrolan terdahulu
-            ...clientMessages  // Masukkan pesan terbaru dari user
+            ...dbHistory,      
+            ...clientMessages  
         ];
         
         parsedBody.messages = finalMessages;
@@ -159,7 +153,10 @@ Saat ini adalah ${currentDateTime}.`;
             parsedBody.model = "MiniMaxAI/MiniMax-M2.7";
         }
 
-        // --- LIMIT TOKEN LEBIH PANJANG (3000 Token) ---
+        // --- MENANGANI PARAMETER STREAM DARI KLIEN SECARA AMAN ---
+        // Jika klien meminta stream, kita izinkan jika diinginkan, namun karena keterbatasan environment 
+        // Appwrite, kita atur provider non-stream agar output JSON selalu stabil dan tidak 500 error.
+        parsedBody.stream = false; 
         parsedBody.max_tokens = parsedBody.max_tokens ? Math.min(parsedBody.max_tokens, 3000) : 3000;
 
         const bodyData = JSON.stringify(parsedBody);
@@ -183,7 +180,6 @@ Saat ini adalah ${currentDateTime}.`;
         const usedTokens = rawData.usage?.total_tokens || 0;
         let rawContent = rawData.choices?.[0]?.message?.content || "";
 
-        // --- TANGKAP TAG MEMORY DARI JAWABAN AI ---
         let memoryUpdated = false;
         let newMemoryString = currentMemory;
         const memoryMatch = rawContent.match(/<save_memory>([\s\S]*?)<\/save_memory>/i);
@@ -195,23 +191,19 @@ Saat ini adalah ${currentDateTime}.`;
             memoryUpdated = true;
         }
         
-        // --- HAPUS THINK, TAG MEMORY (AGAR USER TIDAK LIHAT), & UBAH BINTANG ---
         const cleanedContent = rawContent
-            .replace(/<think>[\s\S]*?<\/think>\s*/g, "") // Hapus tag think
-            .replace(/<save_memory>[\s\S]*?<\/save_memory>\s*/gi, "") // Sembunyikan tag save dari user
-            .replace(/\*\*/g, "*") // Ubah **bold** jadi *bold*
+            .replace(/<think>[\s\S]*?<\/think>\s*/g, "") 
+            .replace(/<save_memory>[\s\S]*?<\/save_memory>\s*/gi, "") 
+            .replace(/\*\*/g, "*") 
             .trim();
 
         const ipcashCost = Number((usedTokens * 0.00000002 + (rawData.usage?.total_cost_gnk || 0)).toFixed(9));
 
-        // --- UPDATE HISTORY BARU (Maksimal 10 Pesan Terakhir) ---
         for (let m of clientMessages) { dbHistory.push(m); }
         dbHistory.push({ role: "assistant", content: cleanedContent });
         
-        // Ambil 10 pesan terakhir saja agar tidak kepanjangan
         if (dbHistory.length > 10) dbHistory = dbHistory.slice(-10);
 
-        // --- SISTEM UPDATE DB (BILLING, HISTORY, & MEMORY) ---
         const newBalance = Math.max(0, userData.tokenBalance - usedTokens);
         
         let dataToUpdate = {};
