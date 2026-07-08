@@ -9,13 +9,21 @@ export default async ({ req, res, log, error }) => {
 
     const databases = new Databases(client);
 
-    const PROVIDER_URL = "https://gate.joingonka.ai/v1/chat/completions";
+    // --- PENGATURAN API KEY & ENDPOINT ---
+    const GONKA_URL = "https://gate.joingonka.ai/v1/chat/completions";
     const PROVIDER_API_KEY = process.env.PROVIDER_API_KEY;
+    
+    // API Comet untuk Image & Vision
+    const COMET_API_KEY = process.env.COMET_API_KEY; 
+    const COMET_URL_RESPONSES = "https://api.cometapi.com/v1/responses";
+    const COMET_URL_CHAT = "https://api.cometapi.com/v1/chat/completions";
+
     const DATABASE_ID = process.env.DATABASE_ID;
     const COLLECTION_ID = process.env.COLLECTION_ID;
-    
-    // API KEY KHUSUS DB (Tambahkan variabel CUSTOM_DB_API_KEY di ENV Appwrite)
     const MASTER_DB_KEY = process.env.CUSTOM_DB_API_KEY; 
+
+    // --- PENGATURAN HARGA / TARIF TOKEN ---
+    const COST_IMAGE_GEN = 500; // Harga flat potong saldo untuk 1x Generate Gambar
 
     // --- AMBIL API KEY DARI HEADER ---
     const authHeader = req.headers['authorization'];
@@ -54,12 +62,7 @@ export default async ({ req, res, log, error }) => {
                     return res.json({ error: "Format JSON pada body request DB tidak valid." }, 400);
                 }
 
-                const result = await databases.createDocument(
-                    DATABASE_ID,
-                    COLLECTION_ID,
-                    ID.unique(), 
-                    bodyData
-                );
+                const result = await databases.createDocument(DATABASE_ID, COLLECTION_ID, ID.unique(), bodyData);
                 log(`[DB MODE] Web menyimpan data baru: ${result.$id}`);
                 return res.json({ success: true, message: "Data berhasil disimpan!", data: result }, 201);
             }
@@ -92,9 +95,7 @@ export default async ({ req, res, log, error }) => {
 
         const isUnlimited = userData.role === 'developer' || userData.premium === 'plus' || userData.premium === 'super';
         if (!isUnlimited && userData.tokenBalance <= 0) {
-            return res.json({ 
-                error: "Saldo token kamu habis. Silakan top-up untuk melanjutkan penggunaan iprimeAI." 
-            }, 402);
+            return res.json({ error: "Saldo token kamu habis. Silakan top-up untuk melanjutkan penggunaan iprimeAI." }, 402);
         }
 
         let parsedBody = {};
@@ -104,6 +105,53 @@ export default async ({ req, res, log, error }) => {
             return res.json({ error: "Format JSON pada body request tidak valid." }, 400);
         }
 
+        const requestedModel = parsedBody.model || "IprimeAi-2.7M";
+
+        // ============================================================================
+        // CABANG A: KHUSUS IMAGE GENERATION (Kling, Qwen, dll)
+        // ============================================================================
+        const imageModels = ["kling_image", "qwen-image", "gpt-4o-image"];
+        
+        if (imageModels.includes(requestedModel)) {
+            // Cek saldo cukup atau tidak untuk bikin gambar
+            if (!isUnlimited && userData.tokenBalance < COST_IMAGE_GEN) {
+                return res.json({ error: `Saldo tidak cukup untuk membuat gambar. Membutuhkan ${COST_IMAGE_GEN} token.` }, 402);
+            }
+
+            // Ekstrak prompt gambar (bisa dari field 'input', 'prompt', atau pesan chat terakhir)
+            let promptText = parsedBody.input || parsedBody.prompt;
+            if (!promptText && parsedBody.messages && parsedBody.messages.length > 0) {
+                const lastMsg = parsedBody.messages[parsedBody.messages.length - 1].content;
+                promptText = typeof lastMsg === 'string' ? lastMsg : JSON.stringify(lastMsg);
+            }
+
+            const aiResponse = await fetch(COMET_URL_RESPONSES, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${COMET_API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: requestedModel,
+                    input: promptText || "A beautiful futuristic city"
+                })
+            });
+
+            const rawData = await aiResponse.json();
+
+            // Potong saldo khusus Image Gen
+            if (aiResponse.ok && !isUnlimited) {
+                const newBalance = Math.max(0, userData.tokenBalance - COST_IMAGE_GEN);
+                await databases.updateDocument(DATABASE_ID, COLLECTION_ID, userData.$id, { tokenBalance: newBalance });
+                log(`[BILLING] Potong ${COST_IMAGE_GEN} token (Image Gen). Sisa saldo ${userData.userName}: ${newBalance}`);
+            }
+
+            return res.json(rawData, aiResponse.status);
+        }
+
+        // ============================================================================
+        // CABANG B: KHUSUS TEKS & VISION (IprimeAI & GPT-5 Nano)
+        // ============================================================================
         const clientWantsStream = parsedBody.stream === true;
 
         let dbHistory = [];
@@ -146,24 +194,30 @@ Saat ini adalah ${currentDateTime}.`;
         ];
         
         parsedBody.messages = finalMessages;
-
-        if (parsedBody.model === "IprimeAi-2.7M" || !parsedBody.model) {
-            parsedBody.model = "MiniMaxAI/MiniMax-M2.7";
-        }
-
-        // Paksa ke provider non-stream agar kestabilan teks terjaga 100%
         parsedBody.stream = false;
         parsedBody.max_tokens = parsedBody.max_tokens ? Math.min(parsedBody.max_tokens, 3000) : 3000;
 
-        const bodyData = JSON.stringify(parsedBody);
+        // --- SMART ROUTER (PENGARAH TEKS/VISION) ---
+        let targetApiUrl = GONKA_URL;
+        let targetApiKey = PROVIDER_API_KEY;
 
-        const aiResponse = await fetch(PROVIDER_URL, {
+        if (requestedModel === "gpt-5-nano") {
+            // Belokkan ke CometAPI untuk Vision & Chat GPT-5 Nano
+            targetApiUrl = COMET_URL_CHAT;
+            targetApiKey = COMET_API_KEY;
+            parsedBody.model = "gpt-5-nano";
+        } else {
+            // Default ke Iprime (MiniMax) di JoinGonka
+            parsedBody.model = "MiniMaxAI/MiniMax-M2.7";
+        }
+
+        const aiResponse = await fetch(targetApiUrl, {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${PROVIDER_API_KEY}`,
+                'Authorization': `Bearer ${targetApiKey}`,
                 'Content-Type': 'application/json'
             },
-            body: bodyData
+            body: JSON.stringify(parsedBody)
         });
 
         const rawData = await aiResponse.json();
@@ -214,7 +268,7 @@ Saat ini adalah ${currentDateTime}.`;
             dataToUpdate
         );
         
-        if (!isUnlimited && usedTokens > 0) log(`[BILLING] Memotong ${usedTokens} token. Sisa saldo ${userData.userName}: ${newBalance}`);
+        if (!isUnlimited && usedTokens > 0) log(`[BILLING] Memotong ${usedTokens} token (${requestedModel}). Sisa saldo: ${newBalance}`);
         if (memoryUpdated) log(`[MEMORY SAVED] Menyimpan ingatan untuk ${userData.userName}`);
 
         const providerId = rawData.id || "iprime-" + Date.now();
@@ -226,13 +280,13 @@ Saat ini adalah ${currentDateTime}.`;
                 id: providerId,
                 object: "chat.completion.chunk",
                 created: Math.floor(Date.now() / 1000),
-                model: "IprimeAi-2.7M",
+                model: requestedModel,
                 choices: [{ index: 0, delta: { content: cleanedContent }, finish_reason: null }]
             })}\n\ndata: ${JSON.stringify({
                 id: providerId,
                 object: "chat.completion.chunk",
                 created: Math.floor(Date.now() / 1000),
-                model: "IprimeAi-2.7M",
+                model: requestedModel,
                 choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
             })}\n\ndata: [DONE]\n\n`;
 
@@ -241,7 +295,7 @@ Saat ini adalah ${currentDateTime}.`;
 
         const cleanData = {
             id: providerId,
-            model: "IprimeAi-2.7M",
+            model: requestedModel,
             choices: [
                 {
                     index: 0,
