@@ -107,6 +107,9 @@ export default async ({ req, res, log, error }) => {
             return res.json({ error: "Format JSON pada body request tidak valid." }, 400);
         }
 
+        // --- CEK APAKAH KLIEN MEMINTA STREAM ---
+        const clientWantsStream = parsedBody.stream === true;
+
         // --- TARIK RIWAYAT & MEMORY DARI DATABASE ---
         let dbHistory = [];
         if (userData.chatHistory) {
@@ -153,10 +156,8 @@ Saat ini adalah ${currentDateTime}.`;
             parsedBody.model = "MiniMaxAI/MiniMax-M2.7";
         }
 
-        // --- MENANGANI PARAMETER STREAM DARI KLIEN SECARA AMAN ---
-        // Jika klien meminta stream, kita izinkan jika diinginkan, namun karena keterbatasan environment 
-        // Appwrite, kita atur provider non-stream agar output JSON selalu stabil dan tidak 500 error.
-        parsedBody.stream = false; 
+        // Jika klien minta stream, teruskan ke provider, jika tidak set false
+        parsedBody.stream = clientWantsStream;
         parsedBody.max_tokens = parsedBody.max_tokens ? Math.min(parsedBody.max_tokens, 3000) : 3000;
 
         const bodyData = JSON.stringify(parsedBody);
@@ -170,15 +171,45 @@ Saat ini adalah ${currentDateTime}.`;
             body: bodyData
         });
 
-        const rawData = await aiResponse.json();
+        let rawContent = "";
+        let usedTokens = 0;
+        let providerId = "iprime-" + Date.now();
+        let finishReason = "stop";
 
-        if (!aiResponse.ok) {
-            error(`[PROVIDER ERROR] ${JSON.stringify(rawData)}`);
-            return res.json(rawData, aiResponse.status);
+        // --- PENANGANAN DATA BERDASARKAN STREAM / NON-STREAM ---
+        if (clientWantsStream) {
+            const textResponse = await aiResponse.text();
+            const lines = textResponse.split('\n');
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (trimmed.startsWith('data: ')) {
+                    const jsonStr = trimmed.slice(6);
+                    if (jsonStr === '[DONE]') break;
+                    try {
+                        const parsed = JSON.parse(jsonStr);
+                        if (parsed.id) providerId = parsed.id;
+                        const delta = parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.message?.content || "";
+                        rawContent += delta;
+                        if (parsed.usage?.total_tokens) {
+                            usedTokens = parsed.usage.total_tokens;
+                        }
+                        if (parsed.choices?.[0]?.finish_reason) {
+                            finishReason = parsed.choices[0].finish_reason;
+                        }
+                    } catch (e) {}
+                }
+            }
+        } else {
+            const rawData = await aiResponse.json();
+            if (!aiResponse.ok) {
+                error(`[PROVIDER ERROR] ${JSON.stringify(rawData)}`);
+                return res.json(rawData, aiResponse.status);
+            }
+            usedTokens = rawData.usage?.total_tokens || 0;
+            rawContent = rawData.choices?.[0]?.message?.content || "";
+            providerId = rawData.id || providerId;
+            finishReason = rawData.choices?.[0]?.finish_reason || "stop";
         }
-
-        const usedTokens = rawData.usage?.total_tokens || 0;
-        let rawContent = rawData.choices?.[0]?.message?.content || "";
 
         let memoryUpdated = false;
         let newMemoryString = currentMemory;
@@ -197,7 +228,7 @@ Saat ini adalah ${currentDateTime}.`;
             .replace(/\*\*/g, "*") 
             .trim();
 
-        const ipcashCost = Number((usedTokens * 0.00000002 + (rawData.usage?.total_cost_gnk || 0)).toFixed(9));
+        const ipcashCost = Number((usedTokens * 0.00000002 + 0).toFixed(9));
 
         for (let m of clientMessages) { dbHistory.push(m); }
         dbHistory.push({ role: "assistant", content: cleanedContent });
@@ -222,7 +253,7 @@ Saat ini adalah ${currentDateTime}.`;
         if (memoryUpdated) log(`[MEMORY SAVED] Menyimpan ingatan untuk ${userData.userName}`);
 
         const cleanData = {
-            id: rawData.id || "iprime-" + Date.now(),
+            id: providerId,
             model: "IprimeAi-2.7M",
             choices: [
                 {
@@ -231,12 +262,12 @@ Saat ini adalah ${currentDateTime}.`;
                         role: "assistant",
                         content: cleanedContent
                     },
-                    finish_reason: rawData.choices?.[0]?.finish_reason || "stop"
+                    finish_reason: finishReason
                 }
             ],
             usage: {
-                prompt_tokens: rawData.usage?.prompt_tokens || 0,
-                completion_tokens: rawData.usage?.completion_tokens || 0,
+                prompt_tokens: 0,
+                completion_tokens: 0,
                 total_tokens: usedTokens,
                 total_cost_ipcash: ipcashCost
             }
