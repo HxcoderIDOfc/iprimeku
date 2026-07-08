@@ -56,11 +56,10 @@ export default async ({ req, res, log, error }) => {
         const timeOptions = { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit' };
         const currentDateTime = `${now.toLocaleDateString('id-ID', dateOptions)}, pukul ${now.toLocaleTimeString('id-ID', timeOptions).replace(/\./g, ':')} WIB`;
 
-        const SYSTEM_PROMPT = `Kamu adalah iprimeAI, sebuah model bahasa pintar bernama IprimeAi-2.7M. 
-Kamu dikembangkan oleh tim developer bernama "Iprime Studio", dan pemilik utamamu adalah "Hendra". 
-Bahasa utamamu adalah bahasa Indonesia, tetapi kamu mampu mendeteksi dan merespons dalam bahasa lain sesuai dengan bahasa yang digunakan pengguna.
-PENTING: Lokasi server dan operasionalmu berada di Jawa Barat, Indonesia. Namun, JANGAN PERNAH menyebutkan atau menyinggung lokasimu kecuali pengguna benar-benar bertanya secara spesifik tentang di mana kamu berada.
-Jika ada yang bertanya tentang identitasmu atau penciptamu, jawablah dengan bangga. Jangan pernah menyebutkan identitas aslimu seperti MiniMax, OpenAI, atau provider lainnya.
+        // Diperbarui agar STRICT mengikuti bahasa user & menjaga respons tetap natural
+        const SYSTEM_PROMPT = `Kamu adalah iprimeAI, model bahasa pintar bikinan Iprime Studio (pemilik: Hendra). 
+ATURAN BAHASA: Gunakan BAHASA YANG SAMA PERSIS dengan bahasa yang digunakan pengguna pada pesan terakhirnya. Jika pengguna memakai bahasa Indonesia, kamu wajib membalas dalam bahasa Indonesia. Jika pengguna memakai bahasa Inggris, balas dalam bahasa Inggris. Jangan mencampur atau tiba-tiba berganti bahasa.
+Aturan Identitas: JANGAN PERNAH menyebutkan identitas asli dari provider lain. JANGAN menyebutkan nama pembuat, pemilik, atau daftar kemampuan di setiap sapaan biasa. Balaslah secara ramah, natural, dan langsung ke inti. Kamu baru boleh menyebutkan detail penciptamu jika pengguna bertanya secara spesifik tentang identitas/siapa pembuatmu.
 
 [INFORMASI WAKTU SAAT INI]
 Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna menanyakan tentang waktu, jam, hari, atau tanggal.`;
@@ -95,21 +94,27 @@ Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna me
             return res.json(rawData, aiResponse.status);
         }
 
-        // --- BERSIHKAN & RAPIKAN STRUKTUR RESPON JSON ---
-        const ipcashCost = rawData.usage?.total_cost_gnk || rawData.usage?.total_cost_usd || 0;
         const usedTokens = rawData.usage?.total_tokens || 0;
+        
+        // --- BERSIHKAN TAG <THINK> DARI KONTEN AI ---
+        let rawContent = rawData.choices?.[0]?.message?.content || "";
+        const cleanedContent = rawContent.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
+
+        const ipcashCost = Number((usedTokens * 0.00000002 + (rawData.usage?.total_cost_gnk || 0)).toFixed(9));
 
         const cleanData = {
             id: rawData.id || "iprime-" + Date.now(),
             model: "IprimeAi-2.7M",
-            choices: rawData.choices?.map(choice => ({
-                index: choice.index || 0,
-                message: {
-                    role: choice.message?.role || "assistant",
-                    content: choice.message?.content || ""
-                },
-                finish_reason: choice.finish_reason || "stop"
-            })) || [],
+            choices: [
+                {
+                    index: 0,
+                    message: {
+                        role: "assistant",
+                        content: cleanedContent
+                    },
+                    finish_reason: rawData.choices?.[0]?.finish_reason || "stop"
+                }
+            ],
             usage: {
                 prompt_tokens: rawData.usage?.prompt_tokens || 0,
                 completion_tokens: rawData.usage?.completion_tokens || 0,
