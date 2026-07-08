@@ -84,6 +84,9 @@ Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna me
             parsedBody.model = "MiniMaxAI/MiniMax-M2.7";
         }
 
+        // --- ENFORCE MAX TOKENS KE 1000 AMAN DARI TIMEOUT ---
+        parsedBody.max_tokens = parsedBody.max_tokens ? Math.min(parsedBody.max_tokens, 1000) : 1000;
+
         const bodyData = JSON.stringify(parsedBody);
 
         const aiResponse = await fetch(PROVIDER_URL, {
