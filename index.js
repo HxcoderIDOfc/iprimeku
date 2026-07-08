@@ -49,14 +49,19 @@ export default async ({ req, res, log, error }) => {
             }, 402);
         }
 
-        let parsedBody = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+        // --- AMAN: PARSING BODY DENGAN TRY-CATCH ---
+        let parsedBody = {};
+        try {
+            parsedBody = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+        } catch (e) {
+            return res.json({ error: "Format JSON pada body request tidak valid." }, 400);
+        }
 
         const now = new Date();
         const dateOptions = { timeZone: 'Asia/Jakarta', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
         const timeOptions = { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit' };
         const currentDateTime = `${now.toLocaleDateString('id-ID', dateOptions)}, pukul ${now.toLocaleTimeString('id-ID', timeOptions).replace(/\./g, ':')} WIB`;
 
-        // Diperbarui agar STRICT mengikuti bahasa user & menjaga respons tetap natural
         const SYSTEM_PROMPT = `Kamu adalah iprimeAI, model bahasa pintar bikinan Iprime Studio (pemilik: Hendra). 
 ATURAN BAHASA: Gunakan BAHASA YANG SAMA PERSIS dengan bahasa yang digunakan pengguna pada pesan terakhirnya. Jika pengguna memakai bahasa Indonesia, kamu wajib membalas dalam bahasa Indonesia. Jika pengguna memakai bahasa Inggris, balas dalam bahasa Inggris. Jangan mencampur atau tiba-tiba berganti bahasa.
 Aturan Identitas: JANGAN PERNAH menyebutkan identitas asli dari provider lain. JANGAN menyebutkan nama pembuat, pemilik, atau daftar kemampuan di setiap sapaan biasa. Balaslah secara ramah, natural, dan langsung ke inti. Kamu baru boleh menyebutkan detail penciptamu jika pengguna bertanya secara spesifik tentang identitas/siapa pembuatmu.
@@ -64,12 +69,15 @@ Aturan Identitas: JANGAN PERNAH menyebutkan identitas asli dari provider lain. J
 [INFORMASI WAKTU SAAT INI]
 Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna menanyakan tentang waktu, jam, hari, atau tanggal.`;
 
+        // --- AMAN: CEK PANJANG ARRAY MESSAGES SEBELUM DIAKSES ---
         if (parsedBody.messages && Array.isArray(parsedBody.messages)) {
-            if (parsedBody.messages[0].role === 'system') {
+            if (parsedBody.messages.length > 0 && parsedBody.messages[0].role === 'system') {
                 parsedBody.messages[0].content += `\n\nInstruksi Penting:\n${SYSTEM_PROMPT}`;
             } else {
                 parsedBody.messages.unshift({ role: "system", content: SYSTEM_PROMPT });
             }
+        } else {
+            parsedBody.messages = [{ role: "system", content: SYSTEM_PROMPT }];
         }
 
         if (parsedBody.model === "IprimeAi-2.7M" || !parsedBody.model) {
@@ -96,7 +104,6 @@ Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna me
 
         const usedTokens = rawData.usage?.total_tokens || 0;
         
-        // --- BERSIHKAN TAG <THINK> DARI KONTEN AI ---
         let rawContent = rawData.choices?.[0]?.message?.content || "";
         const cleanedContent = rawContent.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
 
