@@ -40,14 +40,12 @@ export default async ({ req, res, log, error }) => {
     // ============================================================================
     if (requestToken === MASTER_DB_KEY) {
         try {
-            // MODE BACA (GET) -> Ambil semua data user dari DB
             if (req.method === 'GET') {
                 const responseDb = await databases.listDocuments(DATABASE_ID, COLLECTION_ID);
                 log(`[DB MODE] Web mengekstrak ${responseDb.total} data.`);
                 return res.json({ success: true, data: responseDb.documents }, 200);
             }
 
-            // MODE TULIS (POST) -> Simpan data user baru ke DB
             if (req.method === 'POST') {
                 let bodyData = {};
                 try {
@@ -99,7 +97,6 @@ export default async ({ req, res, log, error }) => {
             }, 402);
         }
 
-        // --- AMAN: PARSING BODY DENGAN TRY-CATCH ---
         let parsedBody = {};
         try {
             parsedBody = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
@@ -107,10 +104,8 @@ export default async ({ req, res, log, error }) => {
             return res.json({ error: "Format JSON pada body request tidak valid." }, 400);
         }
 
-        // --- CEK APAKAH KLIEN MEMINTA STREAM ---
         const clientWantsStream = parsedBody.stream === true;
 
-        // --- TARIK RIWAYAT & MEMORY DARI DATABASE ---
         let dbHistory = [];
         if (userData.chatHistory) {
             try { dbHistory = JSON.parse(userData.chatHistory); } catch (e) {}
@@ -156,8 +151,8 @@ Saat ini adalah ${currentDateTime}.`;
             parsedBody.model = "MiniMaxAI/MiniMax-M2.7";
         }
 
-        // Jika klien minta stream, teruskan ke provider, jika tidak set false
-        parsedBody.stream = clientWantsStream;
+        // Paksa ke provider non-stream agar kestabilan teks terjaga 100%
+        parsedBody.stream = false;
         parsedBody.max_tokens = parsedBody.max_tokens ? Math.min(parsedBody.max_tokens, 3000) : 3000;
 
         const bodyData = JSON.stringify(parsedBody);
@@ -171,45 +166,15 @@ Saat ini adalah ${currentDateTime}.`;
             body: bodyData
         });
 
-        let rawContent = "";
-        let usedTokens = 0;
-        let providerId = "iprime-" + Date.now();
-        let finishReason = "stop";
+        const rawData = await aiResponse.json();
 
-        // --- PENANGANAN DATA BERDASARKAN STREAM / NON-STREAM ---
-        if (clientWantsStream) {
-            const textResponse = await aiResponse.text();
-            const lines = textResponse.split('\n');
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (trimmed.startsWith('data: ')) {
-                    const jsonStr = trimmed.slice(6);
-                    if (jsonStr === '[DONE]') break;
-                    try {
-                        const parsed = JSON.parse(jsonStr);
-                        if (parsed.id) providerId = parsed.id;
-                        const delta = parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.message?.content || "";
-                        rawContent += delta;
-                        if (parsed.usage?.total_tokens) {
-                            usedTokens = parsed.usage.total_tokens;
-                        }
-                        if (parsed.choices?.[0]?.finish_reason) {
-                            finishReason = parsed.choices[0].finish_reason;
-                        }
-                    } catch (e) {}
-                }
-            }
-        } else {
-            const rawData = await aiResponse.json();
-            if (!aiResponse.ok) {
-                error(`[PROVIDER ERROR] ${JSON.stringify(rawData)}`);
-                return res.json(rawData, aiResponse.status);
-            }
-            usedTokens = rawData.usage?.total_tokens || 0;
-            rawContent = rawData.choices?.[0]?.message?.content || "";
-            providerId = rawData.id || providerId;
-            finishReason = rawData.choices?.[0]?.finish_reason || "stop";
+        if (!aiResponse.ok) {
+            error(`[PROVIDER ERROR] ${JSON.stringify(rawData)}`);
+            return res.json(rawData, aiResponse.status);
         }
+
+        const usedTokens = rawData.usage?.total_tokens || 0;
+        let rawContent = rawData.choices?.[0]?.message?.content || "";
 
         let memoryUpdated = false;
         let newMemoryString = currentMemory;
@@ -228,7 +193,7 @@ Saat ini adalah ${currentDateTime}.`;
             .replace(/\*\*/g, "*") 
             .trim();
 
-        const ipcashCost = Number((usedTokens * 0.00000002 + 0).toFixed(9));
+        const ipcashCost = Number((usedTokens * 0.00000002 + (rawData.usage?.total_cost_gnk || 0)).toFixed(9));
 
         for (let m of clientMessages) { dbHistory.push(m); }
         dbHistory.push({ role: "assistant", content: cleanedContent });
@@ -252,6 +217,28 @@ Saat ini adalah ${currentDateTime}.`;
         if (!isUnlimited && usedTokens > 0) log(`[BILLING] Memotong ${usedTokens} token. Sisa saldo ${userData.userName}: ${newBalance}`);
         if (memoryUpdated) log(`[MEMORY SAVED] Menyimpan ingatan untuk ${userData.userName}`);
 
+        const providerId = rawData.id || "iprime-" + Date.now();
+        const finishReason = rawData.choices?.[0]?.finish_reason || "stop";
+
+        // --- SIMULASI RESPONS STREAM / NON-STREAM KE KLIEN ---
+        if (clientWantsStream) {
+            const ssePayload = `data: ${JSON.stringify({
+                id: providerId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: "IprimeAi-2.7M",
+                choices: [{ index: 0, delta: { content: cleanedContent }, finish_reason: null }]
+            })}\n\ndata: ${JSON.stringify({
+                id: providerId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: "IprimeAi-2.7M",
+                choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
+            })}\n\ndata: [DONE]\n\n`;
+
+            return res.send(ssePayload, 200, { 'Content-Type': 'text/event-stream' });
+        }
+
         const cleanData = {
             id: providerId,
             model: "IprimeAi-2.7M",
@@ -266,8 +253,8 @@ Saat ini adalah ${currentDateTime}.`;
                 }
             ],
             usage: {
-                prompt_tokens: 0,
-                completion_tokens: 0,
+                prompt_tokens: rawData.usage?.prompt_tokens || 0,
+                completion_tokens: rawData.usage?.completion_tokens || 0,
                 total_tokens: usedTokens,
                 total_cost_ipcash: ipcashCost
             }
