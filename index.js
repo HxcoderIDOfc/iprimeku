@@ -26,7 +26,7 @@ export default async ({ req, res, log, error }) => {
     const client = new Client()
         .setEndpoint(process.env.APPWRITE_FUNCTION_API_ENDPOINT)
         .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
-        .setKey(process.env.APPWRITE_FUNCTION_JWT);
+        .setKey(process.env.APPWRITE_API_KEY);
 
     const databases = new Databases(client);
 
@@ -42,13 +42,11 @@ export default async ({ req, res, log, error }) => {
         const userData = responseDb.documents[0];
         log(`[AUTH] User: ${userData.userName} | Role: ${userData.role} | Premium: ${userData.premium} | Token Balance: ${userData.tokenBalance}`);
 
-        // --- CEK LIMIT TOKEN SEBELUM REQUEST ---
-        // Jika developer, atau premium plus/super, maka unlimited (bebas tanpa potong token)
         const isUnlimited = userData.role === 'developer' || userData.premium === 'plus' || userData.premium === 'super';
         if (!isUnlimited && userData.tokenBalance <= 0) {
             return res.json({ 
                 error: "Saldo token kamu habis. Silakan top-up untuk melanjutkan penggunaan iprimeAI." 
-            }, 402); // 402 Payment Required
+            }, 402);
         }
 
         let parsedBody = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
@@ -90,20 +88,37 @@ Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna me
             body: bodyData
         });
 
-        const data = await aiResponse.json();
+        const rawData = await aiResponse.json();
 
         if (!aiResponse.ok) {
-            error(`[PROVIDER ERROR] ${JSON.stringify(data)}`);
-            return res.json(data, aiResponse.status);
+            error(`[PROVIDER ERROR] ${JSON.stringify(rawData)}`);
+            return res.json(rawData, aiResponse.status);
         }
 
-        if (data && data.model) {
-            data.model = "IprimeAi-2.7M";
-        }
+        // --- BERSIHKAN & RAPIKAN STRUKTUR RESPON JSON ---
+        const ipcashCost = rawData.usage?.total_cost_gnk || rawData.usage?.total_cost_usd || 0;
+        const usedTokens = rawData.usage?.total_tokens || 0;
+
+        const cleanData = {
+            id: rawData.id || "iprime-" + Date.now(),
+            model: "IprimeAi-2.7M",
+            choices: rawData.choices?.map(choice => ({
+                index: choice.index || 0,
+                message: {
+                    role: choice.message?.role || "assistant",
+                    content: choice.message?.content || ""
+                },
+                finish_reason: choice.finish_reason || "stop"
+            })) || [],
+            usage: {
+                prompt_tokens: rawData.usage?.prompt_tokens || 0,
+                completion_tokens: rawData.usage?.completion_tokens || 0,
+                total_tokens: usedTokens,
+                total_cost_ipcash: ipcashCost
+            }
+        };
 
         // --- SISTEM PEMOTONGAN TOKEN (BILLING) ---
-        const usedTokens = data.usage ? data.usage.total_tokens : 0;
-        
         if (!isUnlimited && usedTokens > 0) {
             const newBalance = Math.max(0, userData.tokenBalance - usedTokens);
             
@@ -118,7 +133,7 @@ Saat ini adalah ${currentDateTime}. Gunakan informasi ini HANYA jika pengguna me
             log(`[BILLING] Memotong ${usedTokens} token. Sisa saldo ${userData.userName}: ${newBalance}`);
         }
 
-        return res.json(data, 200);
+        return res.json(cleanData, 200);
 
     } catch (err) {
         error(`[SYSTEM ERROR] ${err.message}`);
